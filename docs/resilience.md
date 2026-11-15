@@ -1,8 +1,15 @@
 # Resilience testing
 
-`llm-perf` can validate graceful degradation at the dependency boundaries it
-executes: direct LLM calls, RAG stages, agent LLM/tool calls, and HTTP/gRPC
-application endpoints.
+`llm-perf` includes an application-level chaos engine for LLM systems: it can
+validate graceful degradation by injecting deterministic faults at the
+dependency boundaries it executes — direct LLM calls, RAG stages, agent
+LLM/tool calls, and HTTP/gRPC application endpoints.
+
+Faults are simulated in-process (injected errors and delays), which keeps
+experiments deterministic, credential-free, and CI-friendly. For
+infrastructure-level chaos — killed pods, network partitions, resource
+exhaustion — pair it with an external chaos tool and measure through an
+`app_endpoint` target (see [Boundaries](#boundaries)).
 
 The feature combines four mechanisms:
 
@@ -32,6 +39,78 @@ For framework-managed `pipeline` targets, `llm-perf` can directly measure these
 behaviors. For an externally deployed `app_endpoint`, it validates observable
 behavior only; it cannot prove the service's internal breaker state unless that
 service exports telemetry.
+
+## Chaos experiments
+
+`fault_injection` turns a normal load run into a deterministic chaos
+experiment. A finite `after_s`/`duration_s` window splits the run into three
+phases — baseline traffic, failure traffic, then recovery traffic — so one run
+answers "does the system degrade gracefully, then recover?" `probability`
+randomizes per-attempt injection, and `seed` makes experiments reproducible.
+
+Faults are simulated at the call sites `llm-perf` executes:
+
+| Call site | What the experiment covers |
+|---|---|
+| `llm_api` | Direct provider calls (OpenAI, Anthropic, Azure, Bedrock, HTTP, gRPC). |
+| `retrieve` | Vector-store lookup for RAG context. |
+| `embed` | Embedding calls inside the retrieval path. |
+| `rerank` | Reranker calls. |
+| `generate` | Generation calls in a RAG pipeline. |
+| `agent_step` | LLM calls inside an agent tool-calling loop. |
+| `agent_tool` | Tool invocations inside an agent loop. |
+| `app_endpoint` / `app_endpoint_grpc` | Black-box HTTP/gRPC targets. |
+
+`app_object` targets are not wrapped — manage resilience inside your own
+object for that layer.
+
+### Experiment patterns
+
+Each pattern is a `resilience.fault_injection` block plus the hypothesis it
+tests:
+
+- **Transient dependency failure** — "retries absorb brief outages."
+
+  ```yaml
+  fault_injection: { enabled: true, fault: http_503, probability: 0.2, seed: 7 }
+  ```
+
+  Expect `retry_attempts` > 0, `retry_exhausted` near 0, and a normal error
+  rate.
+
+- **Sustained outage** — "the breaker opens and the fallback serves traffic."
+
+  ```yaml
+  fault_injection: { enabled: true, fault: http_503, probability: 1.0, after_s: 5, duration_s: 20 }
+  ```
+
+  Expect `circuit_opens` >= 1 and `fallback_invocations` during the window,
+  `circuit_half_opens`/`circuit_closes` after it ends, and elevated `degraded`
+  traffic rather than hard failures.
+
+- **Dependency slowdown** — "timeouts and latency SLOs behave."
+
+  ```yaml
+  fault_injection: { enabled: true, fault: latency, latency_s: 2, after_s: 10, duration_s: 30 }
+  ```
+
+  Expect per-stage latency and p95+ to rise inside the window; combine with a
+  tight `timeout_s` to verify slow calls fail fast instead of queueing.
+
+- **Corrupted output** — "quality gates catch bad responses."
+
+  ```yaml
+  fault_injection: { enabled: true, fault: empty_response, probability: 0.5 }
+  ```
+
+  Quality scoring still applies to fallback output, so degraded completions
+  surface in `quality_score_avg`/`quality_pass_rate` alongside availability.
+
+- **Real infrastructure chaos** — leave `fault_injection` off, point an
+  `app_endpoint` target at a deployed service, and fault the infrastructure
+  with an external tool (Chaos Mesh, Litmus, `kill`, firewall rules) while the
+  run measures availability, latency, and recovery. `llm-perf` is the
+  measurement layer; it validates observable behavior only.
 
 ## Configuration shape
 
@@ -240,6 +319,12 @@ amount of fallback completion is acceptable.
 
 ## Boundaries
 
+- Fault injection is simulated in-process. It cannot kill processes, partition
+  networks, drop packets, corrupt DNS, or starve CPU — use an external chaos
+  tool for infrastructure-level experiments and point an `app_endpoint` target
+  at the service under test.
+- Injected faults apply only to calls `llm-perf` executes. They cannot inject
+  failures inside an external service's private dependencies.
 - `app_object` remains externally managed; it is not wrapped by the resilience
   engine in this MVP.
 - `static_response` means the request can complete with degraded text; it is not

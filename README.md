@@ -101,6 +101,7 @@ gating, dataset limits, secret redaction) for untrusted configs.
 | **How much does each request cost?** | `report.pricing` → per-scenario `cost_usd` and `cost_per_success_usd` in reports; `llm_perf.cost.USD` OTel counter; `max_cost` / `max_cost_per_success_usd` SLO rules |
 | **Is quality maintained under load?** | `quality.sample_rate` scores a sample of responses during the run — heuristic, LLM-judge, and RAG context-recall scores land beside performance metrics (`quality_score_avg`, `quality_pass_rate`, `context_recall_avg`); agent runs add task-success rate, tool-call correctness, and loop detection |
 | **Where is the bottleneck?** | `analysis.bottlenecks` in every report splits TTFT (prefill/queueing) from decode (TPOT/ITL), ranks per-stage pipeline latency, rolls up SLO pass/fail, and flags load-generator saturation (CPU/memory/event-loop lag warnings) so you can tell target problems from generator artifacts |
+| **How does my vector store perform under load?** | A retrieve-only `pipeline` times the store per request (stage p50–p99, gateable via `stages: { retrieve: { p95_ms } }`) and scores `RECALL_AT_K`/`PRECISION_AT_K`/`MRR`/`NDCG` live under concurrency when dataset rows carry relevance judgments — or point `app_endpoint` at the store's REST API for pure query latency. Index build time is not measured |
 | **Which safe change reduces latency?** | `llm-perf optimize` evaluates bounded parameter variants under the same workload and writes `optimization-report.json` + `optimized.yaml` with the best feasible configuration |
 | **Does the system degrade gracefully?** | Per-dependency retries, circuit-breaker state transitions, fallback invocations, degraded-call rate, and deterministic fault windows are measured beside latency, quality, cost, and agent success |
 | **Is the service available and usable?** | `availability`, `functional_availability`, and `non_degraded_availability` separate hard failures, quality/agent failures, and fallback-served responses; `slo_windows` shows those rates per load phase |
@@ -232,6 +233,12 @@ targets:
 
 Every stage emits its own OTel span and `llm_perf_stage_duration` metric, so
 thresholds can gate per-stage SLOs (`stages: { retrieve: { p95_ms: 2000 } }`).
+
+Drop `generate`/`rerank` for a **retrieve-only pipeline** that benchmarks the
+vector store itself — query latency and retrieval accuracy (`RECALL_AT_K`,
+`MRR`, `NDCG`) under real concurrency; index build time is not covered. See
+the vector database section in
+[docs/rag-performance-testing.md](docs/rag-performance-testing.md).
 
 **Agent stage** — an OpenAI-compatible tool-calling loop. The model emits
 `tool_calls`, the engine executes them and feeds results back, up to
@@ -406,9 +413,14 @@ targets:
     timeout_s: 60
 ```
 
-For graceful-degradation validation, `resilience:` adds bounded retries,
-closed/open/half-open circuit breakers, fallbacks, and deterministic fault
-windows at framework-managed dependency boundaries:
+`resilience:` is a built-in chaos engine for graceful-degradation validation.
+It injects deterministic faults at the dependency boundaries `llm-perf`
+executes — LLM calls, RAG `retrieve`/`embed`/`rerank`/`generate` stages, agent
+`agent_step`/`agent_tool` calls, and `app_endpoint` requests — then measures
+whether your retries, circuit breakers, and fallbacks keep the system usable.
+Use it to answer "do retries absorb transient failures?", "does the breaker
+open instead of piling up latency?", and "does the pipeline return a
+controlled degraded answer under load?"
 
 ```yaml
 pipeline:
@@ -423,9 +435,27 @@ pipeline:
       fault_injection: { enabled: true, fault: http_503, after_s: 5, duration_s: 20 }
 ```
 
-Reports expose retry exhaustion, breaker openings/rejections, half-open/closed
-recovery, fallback success, degraded traffic, injected faults, quality, and
-agent-success metrics. See [docs/resilience.md](docs/resilience.md) and
+- **fault types**: `timeout`, `connect`, `http_500`, `http_503`, `exception`,
+  `empty_response`, `llm_error`, `latency` (injected delay). `probability`,
+  `after_s`/`duration_s`, and `seed` shape a baseline → failure → recovery
+  campaign in a single run.
+- **fallback types**: `static_response`, `static_context`, `empty_context`,
+  `passthrough`, `alternate_llm`, `alternate_tool`, `alternate_endpoint` —
+  availability depends on the call site.
+- **measured**: `retry_attempts`/`retry_exhausted`, `circuit_opens`,
+  `circuit_half_opens`/`circuit_closes`, `circuit_rejections`,
+  `fallback_invocations`/`fallback_success_rate`, `degraded_rate`, and
+  `fault_injections` per call site, alongside latency, quality, cost, and
+  agent task-success metrics.
+- **thresholdable**: `max_retry_exhausted`, `max_circuit_open_events`,
+  `max_circuit_rejections`, `min_fallback_success_rate`, `max_degraded_rate`,
+  plus the availability SLOs — gate degradation behavior in CI.
+
+Faults are simulated in-process at framework-owned call sites — they cannot
+kill processes or partition networks inside an external service. For
+infrastructure chaos, drive an `app_endpoint` target under load while a real
+chaos tool faults the deployment and let llm-perf measure the outcome. See
+[docs/resilience.md](docs/resilience.md) and
 [configs/rag_resilience.yaml](configs/rag_resilience.yaml).
 
 - **queue wait** — time from virtual-user task start to request dispatch
@@ -787,7 +817,7 @@ Detailed guides live in [`docs/`](docs/README.md):
 - [App object performance testing](docs/app-object-performance-testing.md) — in-process LangChain/LlamaIndex/custom-object benchmarking guide
 - [Workload profiles](docs/workload-profiles.md) — load shaping (smoke→soak), custom stages, E2E testing flow
 - [Optimization](docs/optimization.md) — bounded benchmark-driven parameter tuning
-- [Resilience](docs/resilience.md) — retries, breakers, fallbacks, and fault injection
+- [Resilience](docs/resilience.md) — retries, breakers, fallbacks, and fault-injection chaos experiments
 - [Availability SLOs](docs/slo.md) — request, functional, and non-degraded availability
 - [Methodology](docs/methodology.md) — timing accuracy, gevent concurrency, when streaming metrics are unreliable
 - [Live demo](docs/demo.md) — Docker observability stack, dashboard URLs, mock test walkthrough

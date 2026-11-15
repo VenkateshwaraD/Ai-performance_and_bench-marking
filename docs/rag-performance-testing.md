@@ -381,6 +381,99 @@ thresholds:
 - **Composition** shows `agent_step` vs `agent_tool` median shares — tool
   latency vs LLM latency split per request.
 
+## 2c. Vector database performance testing
+
+A retrieve-only pipeline benchmarks the vector store itself — **query
+latency** and **retrieval accuracy** under real concurrency — without paying
+for a generation call.
+
+### What it does
+
+- **Query latency** — the `retrieve` stage emits a per-stage timing on every
+  request, so the store's p50/p90/p95/p99 lands in `stages[]`, the HTML stage
+  table, `analysis.bottlenecks`, and `stages: { retrieve: { p95_ms } }`
+  threshold rules — under however many concurrent users the load shape drives.
+- **Retrieval accuracy** — `RECALL_AT_K` / `PRECISION_AT_K` / `MRR` / `NDCG`
+  are computed per request *during* the run when the dataset row carries
+  relevance judgments (`relevant_ids`, `relevant_texts`, or `expected_context`),
+  aggregated per scenario, and gateable via `min_recall_at_k`,
+  `min_precision_at_k`, `min_mrr`, `min_ndcg`. Rows without judgments produce
+  no metrics — absent, never a misleading 0.
+- **Store resilience** — `resilience` on `retrieve`/`embed` can fault-inject
+  the store boundary (`latency`, `http_503`, `timeout`) and verify degraded
+  paths (`empty_context`, `passthrough` fallbacks). See
+  [resilience.md](resilience.md).
+
+**Non-goal — index build time / upsert throughput.** There is no ingest path:
+`type: http` assumes a running store, `type: chroma` a pre-built collection,
+and `type: json` re-reads the file per query. Time index builds and bulk
+loads externally; llm-perf covers the query path.
+
+### How to do it
+
+Drop `generate` (and `rerank`) — a pipeline of just `embed` + `retrieve`
+exercises the store exactly like production but returns no answer:
+
+```yaml
+datasets:
+  qa_pairs:
+    source: ../datasets/qa_pairs.jsonl
+    format: jsonl
+    columns: { prompt: question, context: expected_context }
+    # rows may also carry relevant_ids / relevant_texts for exact IR metrics
+
+targets:
+  - name: vector_store
+    layer: pipeline
+    dataset: qa_pairs
+    pipeline:
+      - stage: embed                    # needed for vector-native stores;
+        embedding:                      # skip if the endpoint takes text
+          provider: openai_compat
+          model: text-embedding-3-small
+          base_url: https://api.openai.com/v1
+          api_key_env: OPENAI_API_KEY
+      - stage: retrieve
+        top_k: 10
+        vector_store:
+          type: http                    # your store's query endpoint/proxy
+          url: https://your-store/search
+          api_key_env: STORE_API_KEY
+
+scenarios:
+  - name: vector_store_load
+    target: vector_store
+    weight: 100
+
+load:
+  users: 50
+  spawn_rate: 5
+  duration: 10m                         # or --profile scalability to find the knee
+
+thresholds:
+  scenarios:
+    vector_store_load:
+      max_error_rate: 0.01
+      min_recall_at_k: 0.80
+      min_mrr: 0.70
+      stages: { retrieve: { p95_ms: 200 } }
+  on_fail: fail
+```
+
+For pure query latency without judgments, point an `app_endpoint` target at
+the store's REST API instead — black-box latency/RPS with no dataset.
+
+### Why it is useful
+
+- **Isolate the store's contribution** before spending tokens on generation —
+  is the p95 the store, the embed call, or the LLM?
+- **Compare stores and configs** — different vendors, `top_k` values, index
+  parameters, or embedding models under an identical query mix and load shape.
+- **Find the knee** — where latency or recall degrades as concurrency ramps
+  (`scalability`/`capacity` profiles), before production does.
+- **Gate regressions** — `min_recall_at_k` + `stages: { retrieve: { p95_ms } }`
+  in CI fails the build when an index or schema change hurts retrieval.
+
 ## 3. Run the test
 
 ```bash
